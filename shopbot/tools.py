@@ -1,7 +1,7 @@
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from braintrust import SpanTypeAttribute, start_span
@@ -25,6 +25,12 @@ def _tool(name: str, description: str, properties: dict | None = None) -> dict:
     }
 
 
+_ARRIVED_DAMAGED = {
+    "type": "boolean",
+    "description": "True only if the customer explicitly says the item arrived damaged; otherwise false.",
+}
+
+
 # The order here is part of the prompt cache prefix, so keep it stable.
 TOOLS = [
     _tool("get_my_profile", "Get the logged-in customer's name, email and loyalty tier."),
@@ -32,9 +38,10 @@ TOOLS = [
     _tool("get_order", "Get one of the logged-in customer's orders, with its status, tracking and product.",
           {"order_id": {"type": "string", "description": "Order ID, such as ORD-1001."}}),
     _tool("check_return_eligibility", "Check whether one of the logged-in customer's orders can be returned.",
-          {"order_id": {"type": "string"}}),
+          {"order_id": {"type": "string"}, "arrived_damaged": _ARRIVED_DAMAGED}),
     _tool("create_return", "Create a return for one of the logged-in customer's orders. This changes their account.",
-          {"order_id": {"type": "string"}, "reason": {"type": "string"}}),
+          {"order_id": {"type": "string"}, "reason": {"type": "string"},
+           "arrived_damaged": _ARRIVED_DAMAGED}),
     _tool("search_products", "Search the store catalog by keywords, optionally under a maximum price.",
           {"query": {"type": "string"},
            "max_price": {"type": ["number", "null"], "description": "Maximum price in USD, or null."}}),
@@ -48,13 +55,33 @@ TOOLS = [
 ]
 
 
-def return_eligibility(order: dict, now: datetime | None = None) -> dict:
+def return_eligibility(order: dict, now: datetime | None = None, *, arrived_damaged: bool = False) -> dict:
+    """Apply the store policy once for both the read and write tools.
+
+    Damage is an explicit customer report, never inferred from free-text reasons.
+    It overrides final sale, not the delivery requirement or the return window.
+    """
+    if not isinstance(arrived_damaged, bool):
+        raise ValueError("arrived_damaged must be a boolean")
     now = now or datetime.now(timezone.utc)
     if order["status"] != "delivered":
         return {"eligible": False, "reason": f"Order status is {order['status']}."}
-    days = (now - datetime.fromisoformat(order["ordered_at"])).days
-    if days > RETURN_WINDOW_DAYS:
+    try:
+        delivered_at = datetime.fromisoformat(order["delivered_at"])
+        if delivered_at.utcoffset() is None:
+            raise ValueError("Delivery timestamp must include a timezone")
+    except (KeyError, TypeError, ValueError):
+        return {"eligible": False, "reason": "Delivery date is unavailable; a human agent must review the return."}
+    elapsed = now - delivered_at
+    if elapsed < timedelta(0):
+        return {"eligible": False, "reason": "Delivery date is in the future; a human agent must review the return."}
+    if elapsed > timedelta(days=RETURN_WINDOW_DAYS):
         return {"eligible": False, "reason": f"Outside the {RETURN_WINDOW_DAYS}-day return window."}
+    product = order.get("products")
+    if not isinstance(product, dict) or not isinstance(product.get("final_sale"), bool):
+        return {"eligible": False, "reason": "Final-sale status is unavailable; a human agent must review the return."}
+    if product["final_sale"] and not arrived_damaged:
+        return {"eligible": False, "reason": "Final-sale items cannot be returned unless they arrived damaged."}
     return {"eligible": True, "reason": f"Within the {RETURN_WINDOW_DAYS}-day return window."}
 
 
@@ -111,13 +138,18 @@ class Toolbox:
     def _get_order(self, order_id: str) -> dict:
         return self.store.get_order(self.customer_id, order_id) or {"error": "order_not_found"}
 
-    def _check_return_eligibility(self, order_id: str) -> dict:
+    def _check_return_eligibility(self, order_id: str, arrived_damaged: bool = False) -> dict:
         order = self.store.get_order(self.customer_id, order_id)
-        return return_eligibility(order) if order else {"error": "order_not_found"}
+        return return_eligibility(order, arrived_damaged=arrived_damaged) if order else {"error": "order_not_found"}
 
-    def _create_return(self, order_id: str, reason: str) -> dict:
-        if not self.store.get_order(self.customer_id, order_id):
+    def _create_return(self, order_id: str, reason: str, arrived_damaged: bool = False) -> dict:
+        order = self.store.get_order(self.customer_id, order_id)
+        if not order:
             return {"error": "order_not_found"}
+        # Never trust a previous eligibility call or the model's decision to write.
+        eligibility = return_eligibility(order, arrived_damaged=arrived_damaged)
+        if not eligibility["eligible"]:
+            return {"error": "return_not_eligible", **eligibility}
         if self.dry_run:
             existing = next((a for a in self.actions if a["type"] == "return" and a["order_id"] == order_id), None)
             if existing:
